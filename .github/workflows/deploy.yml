@@ -1,0 +1,106 @@
+name: Deploy Cloud Run Job
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      execute_now:
+        description: "Trigger one Cloud Run Job execution after deploying"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-cloud-run-job
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint, format, and unit tests
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+          uv run --no-sync pytest
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      GCP_DEPLOYER_SA: ${{ vars.GCP_DEPLOYER_SA }}
+      GCP_ARTIFACT_REPO: ${{ vars.GCP_ARTIFACT_REPO || 'yahoo-to-gmail-sync' }}
+      CLOUD_RUN_JOB: ${{ vars.CLOUD_RUN_JOB || 'yahoo-to-gmail-sync' }}
+    steps:
+      - name: Validate deployment variables
+        run: |
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WIF_PROVIDER GCP_DEPLOYER_SA; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Missing required repository variable: ${var}"
+              exit 1
+            fi
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push container image
+        run: |
+          IMAGE_URI="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GCP_ARTIFACT_REPO}/${CLOUD_RUN_JOB}:${GITHUB_SHA}"
+          docker build --tag "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+
+      - name: Update Cloud Run Job
+        run: |
+          gcloud run jobs update "$CLOUD_RUN_JOB" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --image="$IMAGE_URI"
+
+      - name: Execute Cloud Run Job (manual verification)
+        if: github.event_name == 'workflow_dispatch' && inputs.execute_now
+        run: |
+          gcloud run jobs execute "$CLOUD_RUN_JOB" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --wait

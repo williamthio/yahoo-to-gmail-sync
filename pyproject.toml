@@ -1,0 +1,46 @@
+[project]
+name = "yahoo-to-gmail-sync"
+version = "0.1.0"
+description = "Serverless scheduled pipeline that syncs recent Yahoo Mail INBOX emails to Gmail via the Gmail API."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client>=2.150.0,<3.0.0",
+    "google-auth>=2.35.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+setup = [
+    "google-auth-oauthlib>=1.2.1,<2.0.0",
+]
+
+[project.scripts]
+yahoo-to-gmail-sync = "yahoo_to_gmail_sync.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0,<9.0.0",
+    "ruff>=0.8.0,<1.0.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yahoo_to_gmail_sync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106"]

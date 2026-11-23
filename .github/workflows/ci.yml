@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint and format check
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+
+      - name: Run unit tests
+        run: uv run --no-sync pytest
+
+      - name: Verify Docker image build and runtime smoke test
+        run: |
+          docker build --tag yahoo-to-gmail-sync:ci .
+          docker run --rm --entrypoint python yahoo-to-gmail-sync:ci -c "import yahoo_to_gmail_sync"
+          set +e
+          output=$(docker run --rm yahoo-to-gmail-sync:ci)
+          rc=$?
+          set -e
+          echo "$output"
+          test "$rc" -eq 1
+          echo "$output" | grep -q '"severity": "ERROR"'
+          echo "$output" | grep -q 'Configuration error'
