@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Environment & credentials - NEVER commit secrets
+.env
+.env.*
+client_secret*.json
+credentials*.json
+token*.json
+*.pem
+*.key
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
