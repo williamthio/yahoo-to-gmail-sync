@@ -7,7 +7,8 @@ import logging
 import signal
 import sys
 import threading
-import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from yahoo_to_gmail_sync.config import ConfigError, SyncConfig
@@ -16,8 +17,6 @@ from yahoo_to_gmail_sync.sync import format_safe_error, run_sync
 
 class _CloudLoggingJsonFormatter(logging.Formatter):
     """Emit single-line JSON records parsed natively by GCP Cloud Logging."""
-
-    converter = staticmethod(time.gmtime)
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -41,36 +40,41 @@ def _configure_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _install_sigterm_handler(stop_event: threading.Event, logger: logging.Logger) -> None:
-    """Ask the sync loop to stop cleanly when Cloud Run sends SIGTERM."""
+@contextmanager
+def _sigterm_stop_flag() -> Iterator[threading.Event]:
+    """Install a reentrant-safe SIGTERM handler and restore the prior handler on exit."""
+    stop_event = threading.Event()
     if threading.current_thread() is not threading.main_thread():
+        yield stop_event
         return
 
     def _handle_sigterm(_signum: int, _frame: object) -> None:
-        logger.warning("Received SIGTERM; finishing current message before exiting")
+        # Keep the signal handler strictly async-safe (no logging / I/O here).
         stop_event.set()
 
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    previous_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
+    try:
+        yield stop_event
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 def main() -> int:
     _configure_logging()
     logger = logging.getLogger(__name__)
 
-    stop_event = threading.Event()
-    _install_sigterm_handler(stop_event, logger)
+    with _sigterm_stop_flag() as stop_event:
+        try:
+            config = SyncConfig.from_env()
+        except ConfigError as exc:
+            logger.error("Configuration error: %s", exc)
+            return 1
 
-    try:
-        config = SyncConfig.from_env()
-    except ConfigError as exc:
-        logger.error("Configuration error: %s", exc)
-        return 1
-
-    try:
-        stats = run_sync(config, should_stop=stop_event.is_set)
-    except Exception as exc:
-        logger.error("Sync aborted: %s", format_safe_error(exc))
-        return 1
+        try:
+            stats = run_sync(config, should_stop=stop_event.is_set)
+        except Exception as exc:
+            logger.error("Sync aborted: %s", format_safe_error(exc))
+            return 1
 
     logger.info(
         "Sync finished: scanned=%d eligible=%d imported=%d "

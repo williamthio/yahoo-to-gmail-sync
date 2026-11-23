@@ -36,11 +36,11 @@ def _get_or_default(source: Mapping[str, str], key: str, default: str) -> str:
 
 
 def _validate_imap_folder(name: str, env_var: str) -> str:
-    """Ensure IMAP mailbox names contain printable ASCII without CR/LF characters."""
+    """Ensure IMAP mailbox names contain printable ASCII without control characters."""
     if any(ch in name for ch in ("\r", "\n")):
         raise ConfigError(f"{env_var} must not contain newline characters")
-    if not name.isascii():
-        raise ConfigError(f"{env_var} must contain ASCII characters only")
+    if not name.isascii() or not name.isprintable():
+        raise ConfigError(f"{env_var} must contain printable ASCII characters only")
     return name
 
 

@@ -186,3 +186,32 @@ def test_run_sync_stops_gracefully_on_shutdown_signal() -> None:
     assert stats.deferred == 1
     assert stats.failed == 0
     assert yahoo.moved == ["20"]
+
+
+def test_run_sync_stops_gracefully_on_soft_runtime_deadline() -> None:
+    now = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+    candidates = [
+        YahooCandidate("30", datetime(2026, 11, 22, 11, 0, 0, tzinfo=UTC), 100),
+        YahooCandidate("31", datetime(2026, 11, 22, 11, 5, 0, tzinfo=UTC), 100),
+    ]
+    payloads = {
+        "30": b"Message-ID: <first@yahoo.com>\r\n\r\nFirst",
+        "31": b"Message-ID: <second@yahoo.com>\r\n\r\nSecond",
+    }
+    yahoo = FakeYahooClient(candidates, payloads)
+    gmail = FakeGmailClient()
+
+    # Start at t=100 (deadline=310), first candidate at t=105, second at t=315 (past budget).
+    clock = iter([100.0, 105.0, 315.0])
+    stats = run_sync(
+        _config(),
+        yahoo_client=yahoo,
+        gmail_client=gmail,
+        now_utc=now,
+        monotonic_fn=lambda: next(clock),
+    )
+
+    assert stats.imported == 1
+    assert stats.deferred == 1
+    assert stats.failed == 0
+    assert yahoo.moved == ["30"]

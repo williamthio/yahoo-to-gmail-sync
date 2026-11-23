@@ -113,5 +113,10 @@ def test_invalid_numeric_or_folder_overrides_raise() -> None:
 
     env = _valid_env()
     env["YAHOO_ARCHIVE_FOLDER"] = "Archivé"
-    with pytest.raises(ConfigError, match="ASCII"):
+    with pytest.raises(ConfigError, match="printable ASCII"):
+        SyncConfig.from_env(env)
+
+    env = _valid_env()
+    env["YAHOO_ARCHIVE_FOLDER"] = "Bad\x00Folder"
+    with pytest.raises(ConfigError, match="printable ASCII"):
         SyncConfig.from_env(env)

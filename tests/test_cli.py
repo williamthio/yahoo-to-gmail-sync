@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import time
 
 from yahoo_to_gmail_sync import cli
@@ -104,3 +105,18 @@ def test_cli_surfaces_sanitized_api_error_on_abort(monkeypatch, capsys) -> None:
     records = _parse_json_lines(captured.out)
     assert records[-1]["severity"] == "ERROR"
     assert "Gmail API labels.list failed with HTTP 401" in records[-1]["message"]
+
+
+def test_sigterm_handler_sets_flag_without_logging_and_restores_previous(capsys) -> None:
+    previous = signal.getsignal(signal.SIGTERM)
+    with cli._sigterm_stop_flag() as stop_event:
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
+        assert stop_event.is_set() is False
+        handler(signal.SIGTERM, None)
+        assert stop_event.is_set() is True
+
+    assert signal.getsignal(signal.SIGTERM) is previous
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

@@ -399,7 +399,7 @@ class YahooImapClient:
                 missing_uids = [uid for uid in batch if uid not in parsed_uids]
                 if missing_uids:
                     logger.warning(
-                        "Failed to parse IMAP metadata for %d UIDs: %s",
+                        "Missing or unparseable IMAP metadata for %d UIDs: %s",
                         len(missing_uids),
                         ",".join(missing_uids),
                     )
