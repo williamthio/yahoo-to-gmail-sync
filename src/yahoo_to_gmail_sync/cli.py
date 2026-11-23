@@ -5,19 +5,21 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from yahoo_to_gmail_sync.config import ConfigError, SyncConfig
-from yahoo_to_gmail_sync.sync import SyncStats, run_sync
+from yahoo_to_gmail_sync.sync import SyncStats, format_safe_error, run_sync
 
 
 def _configure_logging() -> None:
+    logging.Formatter.converter = time.gmtime
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%SZ",
     )
-    # Suppress verbose third-party HTTP/discovery logs in public Actions runners.
+    # Suppress verbose third-party HTTP/discovery logs.
     for noisy in ("googleapiclient", "google_auth_httplib2", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -43,6 +45,8 @@ def _write_step_summary(stats: SyncStats, *, error_message: str | None = None) -
                 f"- **Failed:** {stats.failed}",
             ]
         )
+        if stats.failed_uids:
+            lines.append(f"- **Failed UIDs:** {', '.join(stats.failed_uids)}")
 
     with Path(summary_path).open("a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -62,20 +66,22 @@ def main() -> int:
     try:
         stats = run_sync(config)
     except Exception as exc:
-        logger.error("Sync aborted: %s", type(exc).__name__)
-        _write_step_summary(SyncStats(), error_message=type(exc).__name__)
+        safe_error = format_safe_error(exc)
+        logger.error("Sync aborted: %s", safe_error)
+        _write_step_summary(SyncStats(), error_message=safe_error)
         return 1
 
     _write_step_summary(stats)
     logger.info(
         "Sync finished: scanned=%d eligible=%d imported=%d "
-        "skipped_duplicate=%d skipped_too_old=%d failed=%d",
+        "skipped_duplicate=%d skipped_too_old=%d failed=%d failed_uids=%s",
         stats.scanned,
         stats.eligible,
         stats.imported,
         stats.skipped_duplicate,
         stats.skipped_too_old,
         stats.failed,
+        ",".join(stats.failed_uids) if stats.failed_uids else "none",
     )
     return 1 if stats.failed > 0 else 0
 

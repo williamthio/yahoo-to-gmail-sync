@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 DEFAULT_YAHOO_IMAP_HOST = "imap.mail.yahoo.com"
@@ -12,7 +14,8 @@ DEFAULT_YAHOO_ARCHIVE_FOLDER = "Forwarded"
 DEFAULT_MAX_AGE_HOURS = 48
 DEFAULT_GMAIL_LABEL_NAME = "Yahoo"
 
-REQUIRED_ENV_VARS = (
+CREDENTIALS_JSON_ENV_VAR = "SYNC_CREDENTIALS_JSON"
+REQUIRED_CREDENTIAL_KEYS = (
     "YAHOO_EMAIL",
     "YAHOO_APP_PASSWORD",
     "GMAIL_CLIENT_ID",
@@ -23,6 +26,33 @@ REQUIRED_ENV_VARS = (
 
 class ConfigError(ValueError):
     """Raised when required configuration is missing or invalid."""
+
+
+def _get_or_default(source: Mapping[str, str], key: str, default: str) -> str:
+    """Return a stripped env value, falling back to default when unset or blank."""
+    value = source.get(key, "").strip()
+    return value or default
+
+
+def _parse_credentials_json(raw_json: str) -> dict[str, str]:
+    """Parse SYNC_CREDENTIALS_JSON without leaking secret contents in errors."""
+    try:
+        parsed = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{CREDENTIALS_JSON_ENV_VAR} must be a valid JSON object") from exc
+
+    if not isinstance(parsed, dict):
+        raise ConfigError(f"{CREDENTIALS_JSON_ENV_VAR} must be a JSON object")
+
+    result: dict[str, str] = {}
+    for key in REQUIRED_CREDENTIAL_KEYS:
+        value = parsed.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ConfigError(f"{CREDENTIALS_JSON_ENV_VAR} field {key} must be a string")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +72,7 @@ class SyncConfig:
     gmail_label_name: str = DEFAULT_GMAIL_LABEL_NAME
 
     def __repr__(self) -> str:
-        # Redact all credentials and identifiers so tracebacks/logs stay safe in public repos.
+        # Redact all credentials and identifiers so tracebacks/logs stay safe.
         return (
             "SyncConfig("
             f"yahoo_imap_host={self.yahoo_imap_host!r}, "
@@ -55,15 +85,32 @@ class SyncConfig:
         )
 
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> SyncConfig:
-        """Load and validate configuration from environment variables."""
+    def from_env(cls, env: Mapping[str, str] | None = None) -> SyncConfig:
+        """Load and validate configuration from environment variables.
+
+        Credentials may be provided via individual environment variables or bundled
+        into a single SYNC_CREDENTIALS_JSON object (recommended for GCP Secret Manager).
+        Individual environment variables take precedence when both are set.
+        """
         source = os.environ if env is None else env
 
-        missing = [name for name in REQUIRED_ENV_VARS if not source.get(name, "").strip()]
-        if missing:
-            raise ConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        credentials: dict[str, str] = {}
+        raw_creds_json = source.get(CREDENTIALS_JSON_ENV_VAR, "").strip()
+        if raw_creds_json:
+            credentials.update(_parse_credentials_json(raw_creds_json))
 
-        port_raw = source.get("YAHOO_IMAP_PORT", str(DEFAULT_YAHOO_IMAP_PORT)).strip()
+        for key in REQUIRED_CREDENTIAL_KEYS:
+            direct_val = source.get(key, "")
+            if direct_val.strip():
+                credentials[key] = direct_val
+
+        missing = [
+            name for name in REQUIRED_CREDENTIAL_KEYS if not credentials.get(name, "").strip()
+        ]
+        if missing:
+            raise ConfigError(f"Missing required credentials: {', '.join(missing)}")
+
+        port_raw = _get_or_default(source, "YAHOO_IMAP_PORT", str(DEFAULT_YAHOO_IMAP_PORT))
         try:
             port = int(port_raw)
         except ValueError as exc:
@@ -71,7 +118,7 @@ class SyncConfig:
         if port <= 0 or port > 65535:
             raise ConfigError("YAHOO_IMAP_PORT must be between 1 and 65535")
 
-        max_age_raw = source.get("SYNC_MAX_AGE_HOURS", str(DEFAULT_MAX_AGE_HOURS)).strip()
+        max_age_raw = _get_or_default(source, "SYNC_MAX_AGE_HOURS", str(DEFAULT_MAX_AGE_HOURS))
         try:
             max_age_hours = int(max_age_raw)
         except ValueError as exc:
@@ -79,28 +126,24 @@ class SyncConfig:
         if max_age_hours <= 0:
             raise ConfigError("SYNC_MAX_AGE_HOURS must be greater than 0")
 
-        yahoo_imap_host = source.get("YAHOO_IMAP_HOST", DEFAULT_YAHOO_IMAP_HOST).strip()
-        yahoo_source_folder = source.get("YAHOO_SOURCE_FOLDER", DEFAULT_YAHOO_SOURCE_FOLDER).strip()
-        yahoo_archive_folder = source.get(
-            "YAHOO_ARCHIVE_FOLDER", DEFAULT_YAHOO_ARCHIVE_FOLDER
-        ).strip()
-        gmail_label_name = source.get("GMAIL_LABEL_NAME", DEFAULT_GMAIL_LABEL_NAME).strip()
+        yahoo_imap_host = _get_or_default(source, "YAHOO_IMAP_HOST", DEFAULT_YAHOO_IMAP_HOST)
+        yahoo_source_folder = _get_or_default(
+            source, "YAHOO_SOURCE_FOLDER", DEFAULT_YAHOO_SOURCE_FOLDER
+        )
+        yahoo_archive_folder = _get_or_default(
+            source, "YAHOO_ARCHIVE_FOLDER", DEFAULT_YAHOO_ARCHIVE_FOLDER
+        )
+        gmail_label_name = _get_or_default(source, "GMAIL_LABEL_NAME", DEFAULT_GMAIL_LABEL_NAME)
 
-        if not yahoo_imap_host:
-            raise ConfigError("YAHOO_IMAP_HOST must not be empty")
-        if not yahoo_source_folder:
-            raise ConfigError("YAHOO_SOURCE_FOLDER must not be empty")
-        if not yahoo_archive_folder:
-            raise ConfigError("YAHOO_ARCHIVE_FOLDER must not be empty")
-        if not gmail_label_name:
-            raise ConfigError("GMAIL_LABEL_NAME must not be empty")
+        if yahoo_source_folder.casefold() == yahoo_archive_folder.casefold():
+            raise ConfigError("YAHOO_SOURCE_FOLDER and YAHOO_ARCHIVE_FOLDER must be different")
 
         return cls(
-            yahoo_email=source["YAHOO_EMAIL"].strip(),
-            yahoo_app_password=source["YAHOO_APP_PASSWORD"],
-            gmail_client_id=source["GMAIL_CLIENT_ID"].strip(),
-            gmail_client_secret=source["GMAIL_CLIENT_SECRET"].strip(),
-            gmail_refresh_token=source["GMAIL_REFRESH_TOKEN"].strip(),
+            yahoo_email=credentials["YAHOO_EMAIL"].strip(),
+            yahoo_app_password=credentials["YAHOO_APP_PASSWORD"].strip("\r\n"),
+            gmail_client_id=credentials["GMAIL_CLIENT_ID"].strip(),
+            gmail_client_secret=credentials["GMAIL_CLIENT_SECRET"].strip(),
+            gmail_refresh_token=credentials["GMAIL_REFRESH_TOKEN"].strip(),
             yahoo_imap_host=yahoo_imap_host,
             yahoo_imap_port=port,
             yahoo_source_folder=yahoo_source_folder,

@@ -49,7 +49,8 @@ class SyncStats:
     failed_uids: list[str] = field(default_factory=list)
 
 
-def _format_safe_error(exc: Exception) -> str:
+def format_safe_error(exc: Exception) -> str:
+    """Return a zero-PII error description suitable for logs and job summaries."""
     if isinstance(exc, (GmailApiError, YahooImapError)):
         return str(exc)
     return type(exc).__name__
@@ -132,6 +133,6 @@ def run_sync(
             except Exception as exc:
                 stats.failed += 1
                 stats.failed_uids.append(candidate.uid)
-                logger.error("Failed processing UID %s: %s", candidate.uid, _format_safe_error(exc))
+                logger.error("Failed processing UID %s: %s", candidate.uid, format_safe_error(exc))
 
     return stats

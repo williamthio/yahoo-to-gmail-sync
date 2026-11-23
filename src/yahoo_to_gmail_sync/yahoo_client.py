@@ -9,9 +9,31 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+_IMAP_MONTH_NAMES = (
+    "",
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+_IMAP_MONTH_NUMBERS = {name.lower(): idx for idx, name in enumerate(_IMAP_MONTH_NAMES) if name}
+_INTERNALDATE_VALUE_PATTERN = re.compile(
+    r"^(?P<day>\d{1,2})-(?P<month>[A-Za-z]{3})-(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+"
+    r"(?P<tz_sign>[+-])(?P<tz_hour>\d{2})(?P<tz_min>\d{2})$"
+)
 
 _META_PATTERN = re.compile(
     rb"UID\s+(?P<uid>\d+).*?"
@@ -46,10 +68,35 @@ class YahooCandidate:
 
 
 def parse_imap_internaldate(value: str) -> datetime:
-    """Parse an IMAP INTERNALDATE string (e.g. '22-Nov-2026 08:15:30 +0000') to UTC."""
+    """Parse an RFC 3501 IMAP INTERNALDATE string to UTC without locale dependence."""
     normalized = " ".join(value.strip().split())
-    parsed = datetime.strptime(normalized, "%d-%b-%Y %H:%M:%S %z")
+    match = _INTERNALDATE_VALUE_PATTERN.match(normalized)
+    if not match:
+        raise ValueError("Invalid IMAP INTERNALDATE format")
+
+    month = _IMAP_MONTH_NUMBERS.get(match.group("month").lower())
+    if month is None:
+        raise ValueError("Unknown IMAP month abbreviation")
+
+    offset_minutes = int(match.group("tz_hour")) * 60 + int(match.group("tz_min"))
+    if match.group("tz_sign") == "-":
+        offset_minutes = -offset_minutes
+
+    parsed = datetime(
+        year=int(match.group("year")),
+        month=month,
+        day=int(match.group("day")),
+        hour=int(match.group("hour")),
+        minute=int(match.group("minute")),
+        second=int(match.group("second")),
+        tzinfo=timezone(timedelta(minutes=offset_minutes)),
+    )
     return parsed.astimezone(UTC)
+
+
+def format_imap_date(dt: datetime) -> str:
+    """Format a date in RFC 3501 IMAP format (DD-Mon-YYYY) without locale dependence."""
+    return f"{dt.day:02d}-{_IMAP_MONTH_NAMES[dt.month]}-{dt.year}"
 
 
 def _quote_mailbox(name: str) -> str:
@@ -65,23 +112,24 @@ def _parse_metadata_item(item: bytes) -> YahooCandidate | None:
         uid = match.group("uid").decode("ascii")
         date_str = match.group("date").decode("ascii")
         size = int(match.group("size").decode("ascii"))
-        return YahooCandidate(
-            uid=uid,
-            internal_date=parse_imap_internaldate(date_str),
-            size_bytes=size,
-        )
+    else:
+        # Fallback when server returns attributes in a different order than requested.
+        uid_m = _UID_PATTERN.search(item)
+        date_m = _INTERNALDATE_PATTERN.search(item)
+        size_m = _SIZE_PATTERN.search(item)
+        if not (uid_m and date_m and size_m):
+            return None
+        uid = uid_m.group(1).decode("ascii")
+        date_str = date_m.group(1).decode("ascii")
+        size = int(size_m.group(1).decode("ascii"))
 
-    # Fallback when server returns attributes in a different order than requested.
-    uid_m = _UID_PATTERN.search(item)
-    date_m = _INTERNALDATE_PATTERN.search(item)
-    size_m = _SIZE_PATTERN.search(item)
-    if not (uid_m and date_m and size_m):
+    try:
+        internal_date = parse_imap_internaldate(date_str)
+    except ValueError:
+        logger.warning("Skipping UID %s due to unparseable IMAP INTERNALDATE", uid)
         return None
-    return YahooCandidate(
-        uid=uid_m.group(1).decode("ascii"),
-        internal_date=parse_imap_internaldate(date_m.group(1).decode("ascii")),
-        size_bytes=int(size_m.group(1).decode("ascii")),
-    )
+
+    return YahooCandidate(uid=uid, internal_date=internal_date, size_bytes=size)
 
 
 def _extract_raw_bytes(fetch_data: list[object]) -> bytes | None:
@@ -94,6 +142,44 @@ def _extract_raw_bytes(fetch_data: list[object]) -> bytes | None:
         ):
             return bytes(entry[1])
     return None
+
+
+def _close_connection(conn: imaplib.IMAP4_SSL | None) -> None:
+    """Best-effort close of an IMAP connection without raising."""
+    if conn is None:
+        return
+    try:
+        conn.logout()
+    except Exception:
+        try:
+            conn.shutdown()
+        except Exception as exc:
+            logger.debug("Ignored error during IMAP shutdown: %s", type(exc).__name__)
+
+
+def _fetch_capabilities(conn: imaplib.IMAP4_SSL) -> frozenset[str]:
+    """Query post-auth IMAP capabilities, falling back to pre-auth conn.capabilities."""
+    tokens: set[str] = set()
+    try:
+        cap_status, cap_data = conn.capability()
+    except Exception:
+        cap_status, cap_data = None, None
+
+    if cap_status == "OK" and cap_data:
+        for entry in cap_data:
+            if isinstance(entry, (bytes, bytearray)):
+                tokens.update(entry.decode("ascii", errors="ignore").upper().split())
+            elif isinstance(entry, str):
+                tokens.update(entry.upper().split())
+
+    if not tokens:
+        for cap in getattr(conn, "capabilities", ()):
+            if isinstance(cap, (bytes, bytearray)):
+                tokens.add(cap.decode("ascii", errors="ignore").upper())
+            elif isinstance(cap, str):
+                tokens.add(cap.upper())
+
+    return frozenset(tokens)
 
 
 class YahooImapClient:
@@ -122,17 +208,19 @@ class YahooImapClient:
         )
         self._sleep = sleep_fn
         self._conn: imaplib.IMAP4_SSL | None = None
+        self._capabilities: frozenset[str] = frozenset()
 
     def __enter__(self) -> YahooImapClient:
-        self.connect()
+        self._with_retry("connect", lambda _conn: None)
         return self
 
     def __exit__(self, *_: object) -> None:
         self.close()
 
     def connect(self) -> None:
-        """Open a TLS IMAP connection, authenticate, and select the source folder."""
+        """Open a TLS IMAP connection, authenticate, refresh capabilities, and select source."""
         self.close()
+        conn: imaplib.IMAP4_SSL | None = None
         try:
             conn = self._imap_factory(self._host, self._port)
             # Ensure wire-level IMAP debugging never leaks credentials or email payloads.
@@ -141,19 +229,25 @@ class YahooImapClient:
             if status != "OK":
                 raise YahooImapError("Yahoo IMAP login rejected", retryable=False)
 
+            capabilities = _fetch_capabilities(conn)
+
             sel_status, _ = conn.select(_quote_mailbox(self._source_folder), readonly=False)
             if sel_status != "OK":
                 raise YahooImapError("Failed to select Yahoo source folder", retryable=False)
 
             self._conn = conn
+            self._capabilities = capabilities
         except YahooImapError:
+            _close_connection(conn)
             raise
         except (OSError, TimeoutError, imaplib.IMAP4.abort) as exc:
+            _close_connection(conn)
             raise YahooImapError(
                 f"Yahoo IMAP transient connection error ({type(exc).__name__})",
                 retryable=True,
             ) from exc
         except imaplib.IMAP4.error as exc:
+            _close_connection(conn)
             raise YahooImapError(
                 f"Yahoo IMAP protocol error ({type(exc).__name__})",
                 retryable=False,
@@ -161,17 +255,10 @@ class YahooImapClient:
 
     def close(self) -> None:
         """Close the IMAP session cleanly."""
-        if self._conn is None:
-            return
-        try:
-            self._conn.logout()
-        except Exception:
-            try:
-                self._conn.shutdown()
-            except Exception as exc:
-                logger.debug("Ignored error during IMAP shutdown: %s", type(exc).__name__)
-        finally:
-            self._conn = None
+        conn = self._conn
+        self._conn = None
+        self._capabilities = frozenset()
+        _close_connection(conn)
 
     def _require_conn(self) -> imaplib.IMAP4_SSL:
         if self._conn is None:
@@ -202,6 +289,8 @@ class YahooImapClient:
                     retryable=False,
                 ) from exc
 
+            # Close broken session so the next attempt reconnects inside the try block.
+            self.close()
             delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
             logger.warning(
                 "Retrying Yahoo IMAP %s (attempt %d/%d) after %.2fs",
@@ -211,7 +300,6 @@ class YahooImapClient:
                 delay,
             )
             self._sleep(delay)
-            self.connect()
 
         assert last_exc is not None
         raise last_exc
@@ -220,14 +308,15 @@ class YahooImapClient:
         """Create the destination folder on Yahoo if it does not already exist."""
 
         def _op(conn: imaplib.IMAP4_SSL) -> None:
-            status, list_data = conn.list('""', _quote_mailbox(self._archive_folder))
-            if status == "OK" and list_data and any(item is not None for item in list_data):
+            quoted_archive = _quote_mailbox(self._archive_folder)
+            status, list_data = conn.list('""', quoted_archive)
+            if status == "OK" and list_data and any(list_data):
                 return
 
-            create_status, _ = conn.create(_quote_mailbox(self._archive_folder))
+            create_status, _ = conn.create(quoted_archive)
             if create_status != "OK":
                 # Re-check in case the server reported ALREADYEXISTS or similar.
-                recheck_status, recheck_data = conn.list('""', _quote_mailbox(self._archive_folder))
+                recheck_status, recheck_data = conn.list('""', quoted_archive)
                 if recheck_status == "OK" and recheck_data and any(recheck_data):
                     return
                 raise YahooImapError("Failed to create Yahoo archive folder", retryable=False)
@@ -240,7 +329,7 @@ class YahooImapClient:
         Uses IMAP SINCE (date-only, with a 1-day safety buffer) followed by an exact
         UTC INTERNALDATE check so timezone differences never drop recent mail.
         """
-        search_since = (cutoff_utc - timedelta(days=1)).strftime("%d-%b-%Y")
+        search_since = format_imap_date(cutoff_utc - timedelta(days=1))
 
         def _search_and_fetch_meta(
             conn: imaplib.IMAP4_SSL,
@@ -249,15 +338,17 @@ class YahooImapClient:
             if status != "OK":
                 raise YahooImapError("Yahoo IMAP UID SEARCH failed", retryable=True)
 
-            if not search_data or not search_data[0]:
-                return [], 0, 0
+            uid_tokens: list[str] = []
+            for raw_uids in search_data or []:
+                if not raw_uids:
+                    continue
+                decoded = (
+                    raw_uids.decode("ascii")
+                    if isinstance(raw_uids, (bytes, bytearray))
+                    else str(raw_uids)
+                )
+                uid_tokens.extend(decoded.split())
 
-            raw_uids = search_data[0]
-            uid_tokens = (
-                raw_uids.decode("ascii").split()
-                if isinstance(raw_uids, (bytes, bytearray))
-                else str(raw_uids).split()
-            )
             if not uid_tokens:
                 return [], 0, 0
 
@@ -307,28 +398,31 @@ class YahooImapClient:
     def mark_read_and_move(self, uid: str) -> None:
         """Mark a message as READ (\\Seen) and move it out of INBOX to the archive folder."""
         target = _quote_mailbox(self._archive_folder)
+        copied = False
 
         def _move(conn: imaplib.IMAP4_SSL) -> None:
+            nonlocal copied
             store_status, _ = conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Seen)")
             if store_status != "OK":
                 raise YahooImapError(f"Failed to mark UID {uid} as read", retryable=True)
 
-            capabilities = {cap.upper() for cap in getattr(conn, "capabilities", ())}
-            if "MOVE" in capabilities or b"MOVE" in capabilities:
+            if "MOVE" in self._capabilities:
                 move_status, _ = conn.uid("MOVE", uid, target)
                 if move_status != "OK":
                     raise YahooImapError(f"Yahoo IMAP MOVE failed for UID {uid}", retryable=True)
                 return
 
-            copy_status, _ = conn.uid("COPY", uid, target)
-            if copy_status != "OK":
-                raise YahooImapError(f"Yahoo IMAP COPY failed for UID {uid}", retryable=True)
+            if not copied:
+                copy_status, _ = conn.uid("COPY", uid, target)
+                if copy_status != "OK":
+                    raise YahooImapError(f"Yahoo IMAP COPY failed for UID {uid}", retryable=True)
+                copied = True
 
             del_status, _ = conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Deleted)")
             if del_status != "OK":
                 raise YahooImapError(f"Failed to mark UID {uid} deleted after COPY", retryable=True)
 
-            if "UIDPLUS" in capabilities or b"UIDPLUS" in capabilities:
+            if "UIDPLUS" in self._capabilities:
                 exp_status, _ = conn.uid("EXPUNGE", uid)
             else:
                 exp_status, _ = conn.expunge()

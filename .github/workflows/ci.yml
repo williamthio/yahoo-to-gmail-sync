@@ -34,3 +34,6 @@ jobs:
 
       - name: Run unit tests
         run: uv run --no-sync pytest
+
+      - name: Verify Docker image build
+        run: docker build --tag yahoo-to-gmail-sync:ci .

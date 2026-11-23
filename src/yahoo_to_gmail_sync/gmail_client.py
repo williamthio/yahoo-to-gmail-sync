@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import logging
 import random
+import re
 import time
 from collections.abc import Callable
 from email import policy
 from email.parser import BytesHeaderParser
 from typing import Any
 
+import httplib2
+from google.auth.exceptions import TransportError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -28,7 +32,17 @@ GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105
 MAX_IMPORT_BYTES = 35 * 1024 * 1024
 _RESUMABLE_THRESHOLD_BYTES = 5 * 1024 * 1024
 _MAX_RETRIES = 4
-_RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_IDEMPOTENT_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_NON_IDEMPOTENT_RETRYABLE_STATUSES = frozenset({429})
+_TRANSPORT_ERRORS = (
+    OSError,
+    TimeoutError,
+    httplib2.HttpLib2Error,
+    http.client.HTTPException,
+    TransportError,
+)
+_ANGLE_MSG_ID_PATTERN = re.compile(r"<[^<>\r\n]+>")
+_CONTROL_OR_QUOTE_PATTERN = re.compile(r'[\x00-\x1f\x7f"]+')
 
 
 class GmailApiError(RuntimeError):
@@ -53,7 +67,14 @@ def extract_message_id(raw_bytes: bytes) -> str | None:
     if not raw_id:
         return None
     normalized = " ".join(str(raw_id).split()).strip()
-    return normalized or None
+    if not normalized:
+        return None
+
+    # Prefer the angle-bracketed msg-id token so RFC 5322 comments are dropped cleanly.
+    bracketed = _ANGLE_MSG_ID_PATTERN.search(normalized)
+    if bracketed:
+        return bracketed.group(0)
+    return normalized
 
 
 class GmailApiClient:
@@ -82,20 +103,33 @@ class GmailApiClient:
             )
             self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-    def _execute_with_retry(self, operation_name: str, request_factory: Callable[[], Any]) -> Any:
+    def _backoff(self, attempt: int) -> float:
+        return (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
+
+    def _execute_with_retry(
+        self,
+        operation_name: str,
+        request_factory: Callable[[], Any],
+        *,
+        idempotent: bool = True,
+    ) -> Any:
+        retryable_statuses = (
+            _IDEMPOTENT_RETRYABLE_STATUSES if idempotent else _NON_IDEMPOTENT_RETRYABLE_STATUSES
+        )
+
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 return request_factory().execute()
             except HttpError as exc:
                 status = getattr(getattr(exc, "resp", None), "status", None)
-                retryable = status in _RETRYABLE_HTTP_STATUSES
+                retryable = status in retryable_statuses
                 if not retryable or attempt == _MAX_RETRIES:
                     raise GmailApiError(
                         f"Gmail API {operation_name} failed with HTTP {status}",
                         status_code=status,
-                        retryable=retryable,
+                        retryable=status in _IDEMPOTENT_RETRYABLE_STATUSES,
                     ) from exc
-                delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
+                delay = self._backoff(attempt)
                 logger.warning(
                     "Retrying Gmail API %s after HTTP %s (attempt %d/%d, %.2fs)",
                     operation_name,
@@ -105,13 +139,13 @@ class GmailApiClient:
                     delay,
                 )
                 self._sleep(delay)
-            except (OSError, TimeoutError) as exc:
-                if attempt == _MAX_RETRIES:
+            except _TRANSPORT_ERRORS as exc:
+                if not idempotent or attempt == _MAX_RETRIES:
                     raise GmailApiError(
                         f"Gmail API {operation_name} network error ({type(exc).__name__})",
                         retryable=True,
                     ) from exc
-                delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
+                delay = self._backoff(attempt)
                 logger.warning(
                     "Retrying Gmail API %s after %s (attempt %d/%d, %.2fs)",
                     operation_name,
@@ -133,6 +167,7 @@ class GmailApiClient:
         resp = self._execute_with_retry(
             "labels.list",
             lambda: self._service.users().labels().list(userId="me"),
+            idempotent=True,
         )
         labels = resp.get("labels", []) if isinstance(resp, dict) else []
 
@@ -157,17 +192,18 @@ class GmailApiClient:
                     },
                 )
             ),
+            idempotent=False,
         )
         return str(created["id"])
 
     def message_exists(self, message_id: str) -> bool:
         """Check whether a message with the given RFC 5322 Message-ID already exists in Gmail."""
-        # Strip surrounding whitespace and avoid breaking the Gmail search operator.
-        sanitized_id = message_id.replace('"', "").strip()
+        sanitized_id = _CONTROL_OR_QUOTE_PATTERN.sub("", message_id).strip()
         if not sanitized_id:
             return False
 
-        query = f"rfc822msgid:{sanitized_id}"
+        # Quote the operand so spaces or Gmail operators (e.g. OR, label:) cannot break out.
+        query = f'rfc822msgid:"{sanitized_id}"'
         resp = self._execute_with_retry(
             "messages.list",
             lambda: (
@@ -175,6 +211,7 @@ class GmailApiClient:
                 .messages()
                 .list(userId="me", q=query, includeSpamTrash=True, maxResults=1)
             ),
+            idempotent=True,
         )
         messages = resp.get("messages", []) if isinstance(resp, dict) else []
         return bool(messages)
@@ -203,5 +240,6 @@ class GmailApiClient:
                 )
             )
 
-        resp = self._execute_with_retry("messages.import", _build_request)
+        # Only retry definite rate limits (429); ambiguous 5xx/timeouts are re-checked on next run.
+        resp = self._execute_with_retry("messages.import", _build_request, idempotent=False)
         return str(resp.get("id", ""))
