@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -46,11 +48,12 @@ class SyncStats:
     skipped_duplicate: int = 0
     skipped_too_old: int = 0
     failed: int = 0
+    deferred: int = 0
     failed_uids: list[str] = field(default_factory=list)
 
 
 def format_safe_error(exc: Exception) -> str:
-    """Return a zero-PII error description suitable for logs and job summaries."""
+    """Return a zero-PII error description suitable for logs."""
     if isinstance(exc, (GmailApiError, YahooImapError)):
         return str(exc)
     return type(exc).__name__
@@ -62,8 +65,11 @@ def run_sync(
     yahoo_client: YahooClientProtocol | None = None,
     gmail_client: GmailClientProtocol | None = None,
     now_utc: datetime | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> SyncStats:
     """Execute one stateless sync pass from Yahoo INBOX to Gmail."""
+    deadline = monotonic_fn() + config.max_runtime_seconds
     current_time = now_utc or datetime.now(UTC)
     cutoff_utc = current_time - timedelta(hours=config.max_age_hours)
 
@@ -105,7 +111,16 @@ def run_sync(
 
         yahoo.ensure_archive_folder()
 
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
+            if (should_stop is not None and should_stop()) or monotonic_fn() >= deadline:
+                stats.deferred = len(candidates) - index
+                logger.warning(
+                    "Stopping early due to shutdown signal or time budget; "
+                    "deferring %d remaining candidates to next run",
+                    stats.deferred,
+                )
+                break
+
             if candidate.size_bytes > MAX_IMPORT_BYTES:
                 logger.error(
                     "Skipping UID %s: size_bytes=%d exceeds Gmail 35 MB import limit",

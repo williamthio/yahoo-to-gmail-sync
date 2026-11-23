@@ -26,7 +26,13 @@ def test_from_env_defaults() -> None:
     assert cfg.yahoo_source_folder == "INBOX"
     assert cfg.yahoo_archive_folder == "Forwarded"
     assert cfg.max_age_hours == 48
+    assert cfg.max_runtime_seconds == 210
     assert cfg.gmail_label_name == "Yahoo"
+
+
+def test_sync_config_requires_credentials_at_construction() -> None:
+    with pytest.raises(TypeError):
+        SyncConfig()  # type: ignore[call-arg]
 
 
 def test_from_env_supports_single_json_secret_and_env_override() -> None:
@@ -34,12 +40,14 @@ def test_from_env_supports_single_json_secret_and_env_override() -> None:
         "SYNC_CREDENTIALS_JSON": json.dumps(_valid_env()),
         "GMAIL_LABEL_NAME": "  ",  # Blank optional override falls back to default.
         "SYNC_MAX_AGE_HOURS": "",
+        "SYNC_MAX_RUNTIME_SECONDS": "",
     }
     cfg = SyncConfig.from_env(env)
     assert cfg.yahoo_email == "user@yahoo.com"
     assert cfg.gmail_refresh_token == "super-secret-refresh-token"
     assert cfg.gmail_label_name == "Yahoo"
     assert cfg.max_age_hours == 48
+    assert cfg.max_runtime_seconds == 210
 
     # Direct env var overrides the JSON bundle when both are provided.
     env["YAHOO_EMAIL"] = "override@yahoo.com"
@@ -76,7 +84,7 @@ def test_missing_required_env_raises() -> None:
         SyncConfig.from_env(env)
 
 
-def test_invalid_port_age_or_same_folders_raises() -> None:
+def test_invalid_numeric_or_folder_overrides_raise() -> None:
     env = _valid_env()
     env["YAHOO_IMAP_PORT"] = "not-an-int"
     with pytest.raises(ConfigError, match="YAHOO_IMAP_PORT"):
@@ -88,7 +96,22 @@ def test_invalid_port_age_or_same_folders_raises() -> None:
         SyncConfig.from_env(env)
 
     env = _valid_env()
+    env["SYNC_MAX_RUNTIME_SECONDS"] = "0"
+    with pytest.raises(ConfigError, match="SYNC_MAX_RUNTIME_SECONDS"):
+        SyncConfig.from_env(env)
+
+    env = _valid_env()
     env["YAHOO_SOURCE_FOLDER"] = "INBOX"
     env["YAHOO_ARCHIVE_FOLDER"] = "inbox"
     with pytest.raises(ConfigError, match="must be different"):
+        SyncConfig.from_env(env)
+
+    env = _valid_env()
+    env["YAHOO_ARCHIVE_FOLDER"] = "Bad\r\nFolder"
+    with pytest.raises(ConfigError, match="newline"):
+        SyncConfig.from_env(env)
+
+    env = _valid_env()
+    env["YAHOO_ARCHIVE_FOLDER"] = "Archivé"
+    with pytest.raises(ConfigError, match="ASCII"):
         SyncConfig.from_env(env)

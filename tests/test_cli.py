@@ -1,19 +1,24 @@
-"""Unit tests for the CLI entrypoint, UTC logging, and summary output."""
+"""Unit tests for the CLI entrypoint and Cloud Logging JSON output."""
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from pathlib import Path
 
 from yahoo_to_gmail_sync import cli
 from yahoo_to_gmail_sync.gmail_client import GmailApiError
 from yahoo_to_gmail_sync.sync import SyncStats
 
 
-def test_cli_returns_nonzero_on_missing_env(monkeypatch, tmp_path: Path) -> None:
-    summary = tmp_path / "summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+def _parse_json_lines(text: str) -> list[dict[str, str]]:
+    return [json.loads(line) for line in text.strip().splitlines() if line.strip()]
+
+
+def test_cli_logs_json_error_to_stdout_without_mutating_global_converter(
+    monkeypatch, capsys
+) -> None:
+    original_converter = logging.Formatter.converter
     for key in (
         "SYNC_CREDENTIALS_JSON",
         "YAHOO_EMAIL",
@@ -24,17 +29,19 @@ def test_cli_returns_nonzero_on_missing_env(monkeypatch, tmp_path: Path) -> None
     ):
         monkeypatch.delenv(key, raising=False)
 
-    exit_code = cli.main()
-    assert exit_code == 1
-    assert "Failed (ConfigError)" in summary.read_text(encoding="utf-8")
-    assert logging.Formatter.converter is time.gmtime
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    records = _parse_json_lines(captured.out)
+    assert len(records) == 1
+    assert records[0]["severity"] == "ERROR"
+    assert "Configuration error" in records[0]["message"]
+    assert records[0]["timestamp"].endswith("Z")
+    assert logging.Formatter.converter is original_converter
+    assert original_converter is time.localtime
 
 
-def test_cli_writes_summary_with_failed_uids_and_returns_exit_code(
-    monkeypatch, tmp_path: Path
-) -> None:
-    summary = tmp_path / "summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+def test_cli_logs_info_summary_and_returns_expected_exit_codes(monkeypatch, capsys) -> None:
     monkeypatch.setenv("YAHOO_EMAIL", "u@yahoo.com")
     monkeypatch.setenv("YAHOO_APP_PASSWORD", "pw")
     monkeypatch.setenv("GMAIL_CLIENT_ID", "cid")
@@ -44,7 +51,7 @@ def test_cli_writes_summary_with_failed_uids_and_returns_exit_code(
     monkeypatch.setattr(
         cli,
         "run_sync",
-        lambda _cfg: SyncStats(
+        lambda _cfg, **_kwargs: SyncStats(
             scanned=3,
             eligible=2,
             imported=1,
@@ -54,14 +61,17 @@ def test_cli_writes_summary_with_failed_uids_and_returns_exit_code(
         ),
     )
     assert cli.main() == 0
-    text = summary.read_text(encoding="utf-8")
-    assert "**Status:** Success" in text
-    assert "**Imported to Gmail:** 1" in text
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    records = _parse_json_lines(captured.out)
+    assert records[-1]["severity"] == "INFO"
+    assert "imported=1" in records[-1]["message"]
+    assert "failed_uids=none" in records[-1]["message"]
 
     monkeypatch.setattr(
         cli,
         "run_sync",
-        lambda _cfg: SyncStats(
+        lambda _cfg, **_kwargs: SyncStats(
             scanned=1,
             eligible=1,
             imported=0,
@@ -70,25 +80,27 @@ def test_cli_writes_summary_with_failed_uids_and_returns_exit_code(
         ),
     )
     assert cli.main() == 1
-    updated = summary.read_text(encoding="utf-8")
-    assert "Completed with errors" in updated
-    assert "**Failed UIDs:** 99" in updated
+    captured = capsys.readouterr()
+    records = _parse_json_lines(captured.out)
+    assert records[-1]["severity"] == "INFO"
+    assert "failed=1" in records[-1]["message"]
+    assert "failed_uids=99" in records[-1]["message"]
 
 
-def test_cli_surfaces_sanitized_api_error_on_abort(monkeypatch, tmp_path: Path) -> None:
-    summary = tmp_path / "summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+def test_cli_surfaces_sanitized_api_error_on_abort(monkeypatch, capsys) -> None:
     monkeypatch.setenv("YAHOO_EMAIL", "u@yahoo.com")
     monkeypatch.setenv("YAHOO_APP_PASSWORD", "pw")
     monkeypatch.setenv("GMAIL_CLIENT_ID", "cid")
     monkeypatch.setenv("GMAIL_CLIENT_SECRET", "cs")
     monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "rt")
 
-    def _boom(_cfg):
+    def _boom(_cfg, **_kwargs):
         raise GmailApiError("Gmail API labels.list failed with HTTP 401", status_code=401)
 
     monkeypatch.setattr(cli, "run_sync", _boom)
     assert cli.main() == 1
-    assert "Failed (Gmail API labels.list failed with HTTP 401)" in summary.read_text(
-        encoding="utf-8"
-    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    records = _parse_json_lines(captured.out)
+    assert records[-1]["severity"] == "ERROR"
+    assert "Gmail API labels.list failed with HTTP 401" in records[-1]["message"]

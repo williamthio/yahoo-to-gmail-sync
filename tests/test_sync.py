@@ -7,13 +7,20 @@ from datetime import UTC, datetime
 from yahoo_to_gmail_sync.config import SyncConfig
 from yahoo_to_gmail_sync.gmail_client import MAX_IMPORT_BYTES, GmailApiError
 from yahoo_to_gmail_sync.sync import run_sync
-from yahoo_to_gmail_sync.yahoo_client import YahooCandidate
+from yahoo_to_gmail_sync.yahoo_client import YahooCandidate, YahooImapError
 
 
 class FakeYahooClient:
-    def __init__(self, candidates: list[YahooCandidate], payloads: dict[str, bytes]) -> None:
+    def __init__(
+        self,
+        candidates: list[YahooCandidate],
+        payloads: dict[str, bytes],
+        *,
+        fail_move_uids: set[str] | None = None,
+    ) -> None:
         self._candidates = candidates
         self._payloads = payloads
+        self._fail_move_uids = fail_move_uids or set()
         self.moved: list[str] = []
         self.archive_folder_ensured = False
 
@@ -35,6 +42,8 @@ class FakeYahooClient:
         return self._payloads[uid]
 
     def mark_read_and_move(self, uid: str) -> None:
+        if uid in self._fail_move_uids:
+            raise YahooImapError(f"Yahoo IMAP MOVE failed for UID {uid}", retryable=True)
         self.moved.append(uid)
 
 
@@ -42,6 +51,7 @@ class FakeGmailClient:
     def __init__(self, existing_ids: set[str] | None = None, fail_ids: set[str] | None = None):
         self.existing_ids = existing_ids or set()
         self.fail_ids = fail_ids or set()
+        self.checked_ids: list[str] = []
         self.imported: list[tuple[bytes, list[str]]] = []
 
     def ensure_label(self, label_name: str) -> str:
@@ -49,6 +59,7 @@ class FakeGmailClient:
         return "Label_Yahoo"
 
     def message_exists(self, message_id: str) -> bool:
+        self.checked_ids.append(message_id)
         return message_id in self.existing_ids
 
     def import_message(self, raw_bytes: bytes, label_ids: list[str]) -> str:
@@ -105,8 +116,73 @@ def test_run_sync_imports_new_dedups_existing_and_isolates_failures() -> None:
     assert stats.failed == 2
     assert stats.failed_uids == ["3", "5"]
 
-    # UID 2 (duplicate) and UID 4 (imported) were moved; UID 3 & 5 remain in INBOX to retry/inspect.
+    # UID 2 (duplicate) and UID 4 (imported) were moved; UID 3 & 5 remain in INBOX.
     assert yahoo.moved == ["2", "4"]
     assert yahoo.archive_folder_ensured is True
     assert len(gmail.imported) == 1
     assert gmail.imported[0][1] == ["INBOX", "UNREAD", "Label_Yahoo"]
+
+
+def test_run_sync_empty_candidates_skips_archive_folder_check() -> None:
+    now = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+    yahoo = FakeYahooClient([], {})
+    gmail = FakeGmailClient()
+
+    stats = run_sync(_config(), yahoo_client=yahoo, gmail_client=gmail, now_utc=now)
+
+    assert stats.scanned == 0
+    assert stats.eligible == 0
+    assert yahoo.archive_folder_ensured is False
+
+
+def test_run_sync_handles_missing_message_id_and_post_import_move_failure() -> None:
+    now = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+    candidates = [
+        YahooCandidate("10", datetime(2026, 11, 22, 11, 0, 0, tzinfo=UTC), 100),
+        YahooCandidate("11", datetime(2026, 11, 22, 11, 5, 0, tzinfo=UTC), 100),
+    ]
+    payloads = {
+        "10": b"Subject: No Message-ID header\r\n\r\nBody",
+        "11": b"Message-ID: <move-fail@yahoo.com>\r\n\r\nBody",
+    }
+
+    yahoo = FakeYahooClient(candidates, payloads, fail_move_uids={"11"})
+    gmail = FakeGmailClient()
+
+    stats = run_sync(_config(), yahoo_client=yahoo, gmail_client=gmail, now_utc=now)
+
+    # UID 10 had no Message-ID so message_exists was skipped; UID 11 imported then move failed.
+    assert gmail.checked_ids == ["<move-fail@yahoo.com>"]
+    assert len(gmail.imported) == 2
+    assert yahoo.moved == ["10"]
+    assert stats.imported == 1
+    assert stats.failed == 1
+    assert stats.failed_uids == ["11"]
+
+
+def test_run_sync_stops_gracefully_on_shutdown_signal() -> None:
+    now = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+    candidates = [
+        YahooCandidate("20", datetime(2026, 11, 22, 11, 0, 0, tzinfo=UTC), 100),
+        YahooCandidate("21", datetime(2026, 11, 22, 11, 5, 0, tzinfo=UTC), 100),
+    ]
+    payloads = {
+        "20": b"Message-ID: <one@yahoo.com>\r\n\r\nOne",
+        "21": b"Message-ID: <two@yahoo.com>\r\n\r\nTwo",
+    }
+    yahoo = FakeYahooClient(candidates, payloads)
+    gmail = FakeGmailClient()
+
+    checks = iter([False, True])
+    stats = run_sync(
+        _config(),
+        yahoo_client=yahoo,
+        gmail_client=gmail,
+        now_utc=now,
+        should_stop=lambda: next(checks),
+    )
+
+    assert stats.imported == 1
+    assert stats.deferred == 1
+    assert stats.failed == 0
+    assert yahoo.moved == ["20"]

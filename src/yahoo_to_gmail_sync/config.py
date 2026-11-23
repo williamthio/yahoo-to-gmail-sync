@@ -13,6 +13,7 @@ DEFAULT_YAHOO_SOURCE_FOLDER = "INBOX"
 DEFAULT_YAHOO_ARCHIVE_FOLDER = "Forwarded"
 DEFAULT_MAX_AGE_HOURS = 48
 DEFAULT_GMAIL_LABEL_NAME = "Yahoo"
+DEFAULT_MAX_RUNTIME_SECONDS = 210
 
 CREDENTIALS_JSON_ENV_VAR = "SYNC_CREDENTIALS_JSON"
 REQUIRED_CREDENTIAL_KEYS = (
@@ -32,6 +33,15 @@ def _get_or_default(source: Mapping[str, str], key: str, default: str) -> str:
     """Return a stripped env value, falling back to default when unset or blank."""
     value = source.get(key, "").strip()
     return value or default
+
+
+def _validate_imap_folder(name: str, env_var: str) -> str:
+    """Ensure IMAP mailbox names contain printable ASCII without CR/LF characters."""
+    if any(ch in name for ch in ("\r", "\n")):
+        raise ConfigError(f"{env_var} must not contain newline characters")
+    if not name.isascii():
+        raise ConfigError(f"{env_var} must contain ASCII characters only")
+    return name
 
 
 def _parse_credentials_json(raw_json: str) -> dict[str, str]:
@@ -59,17 +69,18 @@ def _parse_credentials_json(raw_json: str) -> dict[str, str]:
 class SyncConfig:
     """Validated runtime configuration loaded from environment variables."""
 
-    yahoo_email: str = ""
-    yahoo_app_password: str = ""
-    gmail_client_id: str = ""
-    gmail_client_secret: str = ""
-    gmail_refresh_token: str = ""
+    yahoo_email: str
+    yahoo_app_password: str
+    gmail_client_id: str
+    gmail_client_secret: str
+    gmail_refresh_token: str
     yahoo_imap_host: str = DEFAULT_YAHOO_IMAP_HOST
     yahoo_imap_port: int = DEFAULT_YAHOO_IMAP_PORT
     yahoo_source_folder: str = DEFAULT_YAHOO_SOURCE_FOLDER
     yahoo_archive_folder: str = DEFAULT_YAHOO_ARCHIVE_FOLDER
     max_age_hours: int = DEFAULT_MAX_AGE_HOURS
     gmail_label_name: str = DEFAULT_GMAIL_LABEL_NAME
+    max_runtime_seconds: int = DEFAULT_MAX_RUNTIME_SECONDS
 
     def __repr__(self) -> str:
         # Redact all credentials and identifiers so tracebacks/logs stay safe.
@@ -81,6 +92,7 @@ class SyncConfig:
             f"yahoo_archive_folder={self.yahoo_archive_folder!r}, "
             f"max_age_hours={self.max_age_hours!r}, "
             f"gmail_label_name={self.gmail_label_name!r}, "
+            f"max_runtime_seconds={self.max_runtime_seconds!r}, "
             "credentials='<redacted>')"
         )
 
@@ -126,12 +138,24 @@ class SyncConfig:
         if max_age_hours <= 0:
             raise ConfigError("SYNC_MAX_AGE_HOURS must be greater than 0")
 
-        yahoo_imap_host = _get_or_default(source, "YAHOO_IMAP_HOST", DEFAULT_YAHOO_IMAP_HOST)
-        yahoo_source_folder = _get_or_default(
-            source, "YAHOO_SOURCE_FOLDER", DEFAULT_YAHOO_SOURCE_FOLDER
+        max_runtime_raw = _get_or_default(
+            source, "SYNC_MAX_RUNTIME_SECONDS", str(DEFAULT_MAX_RUNTIME_SECONDS)
         )
-        yahoo_archive_folder = _get_or_default(
-            source, "YAHOO_ARCHIVE_FOLDER", DEFAULT_YAHOO_ARCHIVE_FOLDER
+        try:
+            max_runtime_seconds = int(max_runtime_raw)
+        except ValueError as exc:
+            raise ConfigError("SYNC_MAX_RUNTIME_SECONDS must be a positive integer") from exc
+        if max_runtime_seconds <= 0:
+            raise ConfigError("SYNC_MAX_RUNTIME_SECONDS must be greater than 0")
+
+        yahoo_imap_host = _get_or_default(source, "YAHOO_IMAP_HOST", DEFAULT_YAHOO_IMAP_HOST)
+        yahoo_source_folder = _validate_imap_folder(
+            _get_or_default(source, "YAHOO_SOURCE_FOLDER", DEFAULT_YAHOO_SOURCE_FOLDER),
+            "YAHOO_SOURCE_FOLDER",
+        )
+        yahoo_archive_folder = _validate_imap_folder(
+            _get_or_default(source, "YAHOO_ARCHIVE_FOLDER", DEFAULT_YAHOO_ARCHIVE_FOLDER),
+            "YAHOO_ARCHIVE_FOLDER",
         )
         gmail_label_name = _get_or_default(source, "GMAIL_LABEL_NAME", DEFAULT_GMAIL_LABEL_NAME)
 
@@ -150,4 +174,5 @@ class SyncConfig:
             yahoo_archive_folder=yahoo_archive_folder,
             max_age_hours=max_age_hours,
             gmail_label_name=gmail_label_name,
+            max_runtime_seconds=max_runtime_seconds,
         )

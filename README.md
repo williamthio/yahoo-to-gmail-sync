@@ -4,9 +4,9 @@ Serverless, stateless email-forwarding pipeline running as a **GCP Cloud Run Job
 
 ## Architecture & Behavior
 
-- **Runtime:** Python 3.12+ container (`Dockerfile` + `uv.lock` pinned), running as a Cloud Run Job (`--task-timeout=4m`, `--max-retries=0`) so executions stay strictly under the 5-minute schedule and never overlap.
+- **Runtime:** Python 3.12 container (`Dockerfile` + `uv.lock` pinned), running as a Cloud Run Job (`--task-timeout=4m`, `--max-retries=0`) with a 210s soft runtime budget and graceful `SIGTERM` handling to minimize overlap between scheduled runs and emit clean summary logs before timeout.
 - **Source (Yahoo Mail IMAP):**
-  - Connects via TLS (`imap.mail.yahoo.com:993`) using a Yahoo App Password and refreshes post-auth IMAP `CAPABILITY` so `MOVE` and `UIDPLUS` are detected reliably.
+  - Connects via verified TLS (`imap.mail.yahoo.com:993`, `ssl.create_default_context()`) using a Yahoo App Password and refreshes post-auth IMAP `CAPABILITY` so `MOVE` and `UIDPLUS` are detected reliably.
   - Scans `INBOX` only for messages received within the last **48 hours** (`INTERNALDATE` UTC check).
   - Fetches messages with `BODY.PEEK[]` so messages are not marked read before Gmail import succeeds.
   - After import (or confirmed duplicate), marks `\Seen` (`READ`) and moves out of `INBOX` into `Forwarded` (auto-created if absent).
@@ -14,13 +14,14 @@ Serverless, stateless email-forwarding pipeline running as a **GCP Cloud Run Job
   - Uses OAuth2 refresh credentials and `users.messages.import` (`internalDateSource="dateHeader"`).
   - Preserves original `From`, `Date`, `Message-ID`, threading, and attachments.
   - Lands in Gmail `INBOX` as `UNREAD` with an auto-created `Yahoo` label; Gmail's spam filter remains active (`neverMarkSpam` is left at its default `False`).
-- **Crash-Safe Deduplication:**
+- **Crash-Safe Deduplication & Failure Handling:**
   - Before calling `users.messages.import`, checks Gmail via `users.messages.list(q='rfc822msgid:"<id>"', includeSpamTrash=True)`.
   - If a run crashes after Gmail import but before Yahoo's move completes, the next run detects the existing `Message-ID`, skips re-importing, and finishes moving the Yahoo message cleanly.
+  - **Unimportable messages stay in Yahoo `INBOX`:** Messages exceeding Gmail's 35 MB import limit or permanently rejected by Gmail (HTTP 400) are intentionally left untouched in Yahoo `INBOX` so no mail is silently hidden; the job logs the UID and exits non-zero on each run until the message is moved manually or ages past `SYNC_MAX_AGE_HOURS`.
 - **Security & Free-Tier Design:**
   - **Single Secret Manager JSON secret (`SYNC_CREDENTIALS_JSON`):** Keeps secret accesses (~8,640/month) within Secret Manager's 10,000 free monthly accesses.
-  - **Zero-PII logs:** Never logs email addresses, `From`/`To`/`Subject`/`Message-ID`, bodies, OAuth tokens, or raw API/IMAP error payloads. Logs contain counts and numeric IMAP UIDs only.
-  - **Keyless CI/CD:** GitHub Actions runs lint/tests/Docker build on PRs ([ci.yml](.github/workflows/ci.yml)) and deploys to Cloud Run on `main` via Workload Identity Federation ([deploy.yml](.github/workflows/deploy.yml)) with zero static GCP keys.
+  - **Zero-PII structured logs:** Emits single-line JSON logs to `stdout` (natively parsed with accurate severities by Cloud Logging) containing counts and numeric IMAP UIDs only - never email addresses, headers, bodies, OAuth tokens, or raw API/IMAP error payloads.
+  - **Keyless, SHA-pinned CI/CD:** GitHub Actions runs lint/tests/Docker smoke tests on PRs ([ci.yml](.github/workflows/ci.yml)) and deploys to Cloud Run on `main` via Workload Identity Federation locked to `refs/heads/main` ([deploy.yml](.github/workflows/deploy.yml)) with all Actions pinned to immutable commit SHAs.
 
 ---
 
@@ -70,7 +71,7 @@ gcloud config set project "$PROJECT_ID"
      gmail.googleapis.com
    ```
 
-2. **Create Artifact Registry repository with a keep-last-5 cleanup policy** (keeps storage under the 0.5 GB free tier):
+2. **Create Artifact Registry repository with a Delete + Keep-Latest-5 cleanup policy** (keeps storage under the 0.5 GB free tier):
    ```bash
    gcloud artifacts repositories create "$REPO_NAME" \
      --repository-format=docker \
@@ -78,6 +79,11 @@ gcloud config set project "$PROJECT_ID"
 
    cat <<'EOF' > /tmp/ar-cleanup-policy.json
    [
+     {
+       "name": "delete-old",
+       "action": {"type": "Delete"},
+       "condition": {"tagState": "any"}
+     },
      {
        "name": "keep-latest-5",
        "action": {"type": "Keep"},
@@ -150,7 +156,7 @@ gcloud config set project "$PROJECT_ID"
 
 ### 4. Configure GitHub Actions CD (Workload Identity Federation)
 
-1. **Create a deployer service account and WIF pool/provider bound to your repository:**
+1. **Create a deployer service account and WIF pool/provider restricted to `refs/heads/main`:**
    ```bash
    export PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
 
@@ -178,8 +184,8 @@ gcloud config set project "$PROJECT_ID"
      --location="global" \
      --workload-identity-pool="github-pool" \
      --issuer-uri="https://token.actions.githubusercontent.com" \
-     --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
-     --attribute-condition="assertion.repository == '${GITHUB_REPO}'"
+     --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
+     --attribute-condition="assertion.repository == '${GITHUB_REPO}' && assertion.ref == 'refs/heads/main'"
 
    gcloud iam service-accounts add-iam-policy-binding "github-deployer-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
      --role="roles/iam.workloadIdentityUser" \
@@ -208,6 +214,7 @@ Set these via `gcloud run jobs update "$JOB_NAME" --region="$REGION" --update-en
 - `YAHOO_SOURCE_FOLDER` (default: `INBOX`)
 - `YAHOO_ARCHIVE_FOLDER` (default: `Forwarded`)
 - `SYNC_MAX_AGE_HOURS` (default: `48`)
+- `SYNC_MAX_RUNTIME_SECONDS` (default: `210`)
 - `GMAIL_LABEL_NAME` (default: `Yahoo`)
 
 ## Local Development

@@ -30,7 +30,9 @@ GMAIL_SCOPES = (
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105
 
 MAX_IMPORT_BYTES = 35 * 1024 * 1024
-_RESUMABLE_THRESHOLD_BYTES = 5 * 1024 * 1024
+RESUMABLE_THRESHOLD_BYTES = 5 * 1024 * 1024
+RESUMABLE_CHUNK_BYTES = 5 * 1024 * 1024
+
 _MAX_RETRIES = 4
 _IDEMPOTENT_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _NON_IDEMPOTENT_RETRYABLE_STATUSES = frozenset({429})
@@ -42,7 +44,7 @@ _TRANSPORT_ERRORS = (
     TransportError,
 )
 _ANGLE_MSG_ID_PATTERN = re.compile(r"<[^<>\r\n]+>")
-_CONTROL_OR_QUOTE_PATTERN = re.compile(r'[\x00-\x1f\x7f"]+')
+_CONTROL_CHARS_PATTERN = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 class GmailApiError(RuntimeError):
@@ -60,9 +62,20 @@ class GmailApiError(RuntimeError):
         self.retryable = retryable
 
 
+def _slice_header_block(raw_bytes: bytes) -> bytes:
+    """Return only the RFC 5322 header section to avoid buffering large bodies in memory."""
+    crlf_idx = raw_bytes.find(b"\r\n\r\n")
+    lf_idx = raw_bytes.find(b"\n\n")
+    candidates = [idx for idx in (crlf_idx, lf_idx) if idx != -1]
+    if not candidates:
+        return raw_bytes
+    return raw_bytes[: min(candidates)]
+
+
 def extract_message_id(raw_bytes: bytes) -> str | None:
     """Extract and normalize the RFC 5322 Message-ID header, if present."""
-    headers = BytesHeaderParser(policy=policy.default).parsebytes(raw_bytes)
+    header_bytes = _slice_header_block(raw_bytes)
+    headers = BytesHeaderParser(policy=policy.default).parsebytes(header_bytes)
     raw_id = headers.get("Message-ID")
     if not raw_id:
         return None
@@ -77,6 +90,12 @@ def extract_message_id(raw_bytes: bytes) -> str | None:
     return normalized
 
 
+def _escape_gmail_quoted_term(value: str) -> str:
+    """Escape a value for safe interpolation inside a double-quoted Gmail search term."""
+    cleaned = _CONTROL_CHARS_PATTERN.sub("", value).strip()
+    return cleaned.replace("\\", "\\\\").replace('"', '\\"')
+
+
 class GmailApiClient:
     """Minimal, zero-PII Gmail API wrapper using OAuth2 refresh credentials."""
 
@@ -87,11 +106,14 @@ class GmailApiClient:
         refresh_token: str,
         *,
         service: Any | None = None,
+        service_factory: Callable[[], Any] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self._sleep = sleep_fn
-        if service is not None:
-            self._service = service
+        self._service: Any | None = service
+
+        if service_factory is not None:
+            self._service_factory = service_factory
         else:
             creds = Credentials(
                 token=None,
@@ -101,15 +123,17 @@ class GmailApiClient:
                 client_secret=client_secret,
                 scopes=list(GMAIL_SCOPES),
             )
-            self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            self._service_factory = lambda: build(
+                "gmail", "v1", credentials=creds, cache_discovery=False
+            )
 
     def _backoff(self, attempt: int) -> float:
         return (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
 
-    def _execute_with_retry(
+    def _run_with_retry(
         self,
         operation_name: str,
-        request_factory: Callable[[], Any],
+        fn: Callable[[], Any],
         *,
         idempotent: bool = True,
     ) -> Any:
@@ -119,7 +143,7 @@ class GmailApiClient:
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                return request_factory().execute()
+                return fn()
             except HttpError as exc:
                 status = getattr(getattr(exc, "resp", None), "status", None)
                 retryable = status in retryable_statuses
@@ -162,11 +186,32 @@ class GmailApiClient:
                 ) from exc
         raise GmailApiError(f"Gmail API {operation_name} exhausted retries", retryable=True)
 
-    def ensure_label(self, label_name: str) -> str:
-        """Return the ID of an existing Gmail label or create it if absent."""
+    def _get_service(self) -> Any:
+        """Lazily initialize the Gmail discovery client with transient-error retries."""
+        if self._service is None:
+            self._service = self._run_with_retry(
+                "discovery.build", self._service_factory, idempotent=True
+            )
+        return self._service
+
+    def _execute_with_retry(
+        self,
+        operation_name: str,
+        request_factory: Callable[[Any], Any],
+        *,
+        idempotent: bool = True,
+    ) -> Any:
+        service = self._get_service()
+        return self._run_with_retry(
+            operation_name,
+            lambda: request_factory(service).execute(),
+            idempotent=idempotent,
+        )
+
+    def _find_label_id(self, label_name: str) -> str | None:
         resp = self._execute_with_retry(
             "labels.list",
-            lambda: self._service.users().labels().list(userId="me"),
+            lambda svc: svc.users().labels().list(userId="me"),
             idempotent=True,
         )
         labels = resp.get("labels", []) if isinstance(resp, dict) else []
@@ -177,37 +222,52 @@ class GmailApiClient:
         for label in labels:
             if str(label.get("name", "")).lower() == label_name.lower():
                 return str(label["id"])
+        return None
 
-        created = self._execute_with_retry(
-            "labels.create",
-            lambda: (
-                self._service.users()
-                .labels()
-                .create(
-                    userId="me",
-                    body={
-                        "name": label_name,
-                        "labelListVisibility": "labelShow",
-                        "messageListVisibility": "show",
-                    },
-                )
-            ),
-            idempotent=False,
-        )
-        return str(created["id"])
+    def ensure_label(self, label_name: str) -> str:
+        """Return the ID of an existing Gmail label or create it if absent."""
+        existing = self._find_label_id(label_name)
+        if existing is not None:
+            return existing
+
+        try:
+            created = self._execute_with_retry(
+                "labels.create",
+                lambda svc: (
+                    svc.users()
+                    .labels()
+                    .create(
+                        userId="me",
+                        body={
+                            "name": label_name,
+                            "labelListVisibility": "labelShow",
+                            "messageListVisibility": "show",
+                        },
+                    )
+                ),
+                idempotent=False,
+            )
+            return str(created["id"])
+        except GmailApiError as exc:
+            # Handle race condition when overlapping runs create the label concurrently.
+            if exc.status_code == 409:
+                rechecked = self._find_label_id(label_name)
+                if rechecked is not None:
+                    return rechecked
+            raise
 
     def message_exists(self, message_id: str) -> bool:
         """Check whether a message with the given RFC 5322 Message-ID already exists in Gmail."""
-        sanitized_id = _CONTROL_OR_QUOTE_PATTERN.sub("", message_id).strip()
-        if not sanitized_id:
+        escaped_id = _escape_gmail_quoted_term(message_id)
+        if not escaped_id:
             return False
 
-        # Quote the operand so spaces or Gmail operators (e.g. OR, label:) cannot break out.
-        query = f'rfc822msgid:"{sanitized_id}"'
+        # Quote and escape the operand so spaces, quotes, or trailing backslashes stay bounded.
+        query = f'rfc822msgid:"{escaped_id}"'
         resp = self._execute_with_retry(
             "messages.list",
-            lambda: (
-                self._service.users()
+            lambda svc: (
+                svc.users()
                 .messages()
                 .list(userId="me", q=query, includeSpamTrash=True, maxResults=1)
             ),
@@ -221,16 +281,17 @@ class GmailApiClient:
         if len(raw_bytes) > MAX_IMPORT_BYTES:
             raise GmailApiError("Message exceeds Gmail 35 MB import limit", retryable=False)
 
-        use_resumable = len(raw_bytes) > _RESUMABLE_THRESHOLD_BYTES
+        use_resumable = len(raw_bytes) > RESUMABLE_THRESHOLD_BYTES
 
-        def _build_request() -> Any:
+        def _build_request(svc: Any) -> Any:
             media = MediaIoBaseUpload(
                 io.BytesIO(raw_bytes),
                 mimetype="message/rfc822",
+                chunksize=RESUMABLE_CHUNK_BYTES,
                 resumable=use_resumable,
             )
             return (
-                self._service.users()
+                svc.users()
                 .messages()
                 .import_(
                     userId="me",

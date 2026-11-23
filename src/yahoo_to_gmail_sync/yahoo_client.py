@@ -6,6 +6,7 @@ import imaplib
 import logging
 import random
 import re
+import ssl
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -105,6 +106,16 @@ def _quote_mailbox(name: str) -> str:
     return f'"{escaped}"'
 
 
+def _default_imap_factory(host: str, port: int) -> imaplib.IMAP4_SSL:
+    """Create a TLS-verified IMAP4_SSL connection (imaplib defaults to CERT_NONE)."""
+    return imaplib.IMAP4_SSL(
+        host,
+        port,
+        ssl_context=ssl.create_default_context(),
+        timeout=_IMAP_TIMEOUT_SECONDS,
+    )
+
+
 def _parse_metadata_item(item: bytes) -> YahooCandidate | None:
     """Extract UID, INTERNALDATE, and RFC822.SIZE from a single IMAP FETCH metadata line."""
     match = _META_PATTERN.search(item)
@@ -144,10 +155,21 @@ def _extract_raw_bytes(fetch_data: list[object]) -> bytes | None:
     return None
 
 
-def _close_connection(conn: imaplib.IMAP4_SSL | None) -> None:
-    """Best-effort close of an IMAP connection without raising."""
+def _close_connection(conn: imaplib.IMAP4_SSL | None, *, force: bool = False) -> None:
+    """Best-effort close of an IMAP connection without raising.
+
+    When force=True (error/reconnect paths), skip LOGOUT to avoid stalling another
+    full socket timeout on a dead connection.
+    """
     if conn is None:
         return
+    if force:
+        try:
+            conn.shutdown()
+        except Exception as exc:
+            logger.debug("Ignored error during forced IMAP shutdown: %s", type(exc).__name__)
+        return
+
     try:
         conn.logout()
     except Exception:
@@ -203,9 +225,7 @@ class YahooImapClient:
         self._port = port
         self._source_folder = source_folder
         self._archive_folder = archive_folder
-        self._imap_factory = imap_factory or (
-            lambda h, p: imaplib.IMAP4_SSL(h, p, timeout=_IMAP_TIMEOUT_SECONDS)
-        )
+        self._imap_factory = imap_factory or _default_imap_factory
         self._sleep = sleep_fn
         self._conn: imaplib.IMAP4_SSL | None = None
         self._capabilities: frozenset[str] = frozenset()
@@ -238,27 +258,27 @@ class YahooImapClient:
             self._conn = conn
             self._capabilities = capabilities
         except YahooImapError:
-            _close_connection(conn)
+            _close_connection(conn, force=True)
             raise
         except (OSError, TimeoutError, imaplib.IMAP4.abort) as exc:
-            _close_connection(conn)
+            _close_connection(conn, force=True)
             raise YahooImapError(
                 f"Yahoo IMAP transient connection error ({type(exc).__name__})",
                 retryable=True,
             ) from exc
         except imaplib.IMAP4.error as exc:
-            _close_connection(conn)
+            _close_connection(conn, force=True)
             raise YahooImapError(
                 f"Yahoo IMAP protocol error ({type(exc).__name__})",
                 retryable=False,
             ) from exc
 
-    def close(self) -> None:
-        """Close the IMAP session cleanly."""
+    def close(self, *, force: bool = False) -> None:
+        """Close the IMAP session cleanly (or immediately via shutdown when force=True)."""
         conn = self._conn
         self._conn = None
         self._capabilities = frozenset()
-        _close_connection(conn)
+        _close_connection(conn, force=force)
 
     def _require_conn(self) -> imaplib.IMAP4_SSL:
         if self._conn is None:
@@ -289,8 +309,8 @@ class YahooImapClient:
                     retryable=False,
                 ) from exc
 
-            # Close broken session so the next attempt reconnects inside the try block.
-            self.close()
+            # Force-close the broken socket so the next attempt reconnects without waiting 30s.
+            self.close(force=True)
             delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)  # noqa: S311
             logger.warning(
                 "Retrying Yahoo IMAP %s (attempt %d/%d) after %.2fs",
@@ -358,10 +378,11 @@ class YahooImapClient:
             for start in range(0, len(uid_tokens), _FETCH_META_BATCH_SIZE):
                 batch = uid_tokens[start : start + _FETCH_META_BATCH_SIZE]
                 uid_set = ",".join(batch)
-                f_status, fetch_data = conn.uid("FETCH", uid_set, "(INTERNALDATE RFC822.SIZE)")
+                f_status, fetch_data = conn.uid("FETCH", uid_set, "(UID INTERNALDATE RFC822.SIZE)")
                 if f_status != "OK":
                     raise YahooImapError("Yahoo IMAP metadata FETCH failed", retryable=True)
 
+                parsed_uids: set[str] = set()
                 for entry in fetch_data or []:
                     raw_line = entry[0] if isinstance(entry, tuple) else entry
                     if not isinstance(raw_line, (bytes, bytearray)):
@@ -369,10 +390,19 @@ class YahooImapClient:
                     candidate = _parse_metadata_item(bytes(raw_line))
                     if candidate is None:
                         continue
+                    parsed_uids.add(candidate.uid)
                     if candidate.internal_date < cutoff_utc:
                         skipped_too_old += 1
                     else:
                         eligible.append(candidate)
+
+                missing_uids = [uid for uid in batch if uid not in parsed_uids]
+                if missing_uids:
+                    logger.warning(
+                        "Failed to parse IMAP metadata for %d UIDs: %s",
+                        len(missing_uids),
+                        ",".join(missing_uids),
+                    )
 
             eligible.sort(key=lambda item: item.internal_date)
             return eligible, len(uid_tokens), skipped_too_old
@@ -425,6 +455,11 @@ class YahooImapClient:
             if "UIDPLUS" in self._capabilities:
                 exp_status, _ = conn.uid("EXPUNGE", uid)
             else:
+                logger.warning(
+                    "IMAP server lacks MOVE and UIDPLUS; falling back to mailbox-wide EXPUNGE "
+                    "for UID %s",
+                    uid,
+                )
                 exp_status, _ = conn.expunge()
             if exp_status != "OK":
                 raise YahooImapError(f"Yahoo IMAP EXPUNGE failed for UID {uid}", retryable=True)

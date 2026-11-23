@@ -1,6 +1,6 @@
-FROM python:3.12-slim AS builder
+FROM python:3.12.16-slim AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.33 /uv /usr/local/bin/uv
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -18,7 +18,7 @@ COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 
 
-FROM python:3.12-slim AS runtime
+FROM python:3.12.16-slim AS runtime
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser
 
