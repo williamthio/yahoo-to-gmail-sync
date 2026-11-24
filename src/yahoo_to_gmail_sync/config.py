@@ -100,9 +100,9 @@ class SyncConfig:
     def from_env(cls, env: Mapping[str, str] | None = None) -> SyncConfig:
         """Load and validate configuration from environment variables.
 
-        Credentials may be provided via individual environment variables or bundled
-        into a single SYNC_CREDENTIALS_JSON object (recommended for GCP Secret Manager).
-        Individual environment variables take precedence when both are set.
+        Credentials should be provided via individual environment variables (recommended for
+        GitHub Actions per-value secret masking) or optionally bundled into
+        SYNC_CREDENTIALS_JSON. Individual environment variables take precedence when both are set.
         """
         source = os.environ if env is None else env
 

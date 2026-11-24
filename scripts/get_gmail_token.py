@@ -39,16 +39,17 @@ def main() -> int:
     client_id = client_info.get("client_id", creds.client_id)
     client_secret = client_info.get("client_secret", creds.client_secret)
 
-    secret_template = {
-        "YAHOO_EMAIL": "<your-yahoo-email>",
-        "YAHOO_APP_PASSWORD": "<your-yahoo-app-password>",
-        "GMAIL_CLIENT_ID": client_id,
-        "GMAIL_CLIENT_SECRET": client_secret,
-        "GMAIL_REFRESH_TOKEN": creds.refresh_token,
-    }
-
-    print("\nStore this JSON in GCP Secret Manager (do NOT commit it):\n")
-    print(json.dumps(secret_template, indent=2))
+    print(
+        "\nAdd these values as individual GitHub Repository Secrets "
+        "(Settings -> Secrets and variables -> Actions -> Secrets).\n"
+        "Do NOT commit them to git:\n"
+    )
+    print(f"GMAIL_CLIENT_ID={client_id}")
+    print(f"GMAIL_CLIENT_SECRET={client_secret}")
+    print(f"GMAIL_REFRESH_TOKEN={creds.refresh_token}")
+    print("\nAlso add your Yahoo credentials as repository secrets:")
+    print("YAHOO_EMAIL=<your-yahoo-email>")
+    print("YAHOO_APP_PASSWORD=<your-yahoo-app-password>")
     return 0
 
 

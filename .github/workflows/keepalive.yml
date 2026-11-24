@@ -1,0 +1,48 @@
+name: Keepalive Scheduled Workflows
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Push an empty keepalive commit even if last commit is < 50 days old"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive-workflow
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Push empty commit if inactive for 50+ days
+        env:
+          FORCE_KEEPALIVE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          last_commit_ts=$(git log -1 --format=%ct)
+          now_ts=$(date +%s)
+          days_since=$(( (now_ts - last_commit_ts) / 86400 ))
+          echo "Days since last commit on main: ${days_since}"
+
+          if [ "$days_since" -lt 50 ] && [ "$FORCE_KEEPALIVE" != "true" ]; then
+            echo "Repository is active (< 50 days since last commit); skipping keepalive commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep scheduled workflows active"
+          git push origin main

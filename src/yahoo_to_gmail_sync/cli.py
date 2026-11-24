@@ -1,8 +1,7 @@
-"""CLI entrypoint for scheduled and manual Cloud Run Job executions."""
+"""CLI entrypoint for scheduled and manual sync executions."""
 
 from __future__ import annotations
 
-import json
 import logging
 import signal
 import sys
@@ -15,24 +14,17 @@ from yahoo_to_gmail_sync.config import ConfigError, SyncConfig
 from yahoo_to_gmail_sync.sync import format_safe_error, run_sync
 
 
-class _CloudLoggingJsonFormatter(logging.Formatter):
-    """Emit single-line JSON records parsed natively by GCP Cloud Logging."""
+class _UtcPlainFormatter(logging.Formatter):
+    """Emit zero-PII UTC plain-text log lines for console and GitHub Actions logs."""
 
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            ),
-            "severity": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        return json.dumps(payload, ensure_ascii=True)
+        timestamp = datetime.fromtimestamp(record.created, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return f"{timestamp} {record.levelname} {record.name}: {record.getMessage()}"
 
 
 def _configure_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_CloudLoggingJsonFormatter())
+    handler.setFormatter(_UtcPlainFormatter())
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
     # Suppress verbose third-party HTTP/discovery logs.
