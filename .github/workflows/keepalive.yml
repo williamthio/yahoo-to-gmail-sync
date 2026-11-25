@@ -1,8 +1,9 @@
 name: Keepalive Scheduled Workflows
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
+  # Temporarily paused while scheduled sync is disabled.
+  # schedule:
+  #   - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:

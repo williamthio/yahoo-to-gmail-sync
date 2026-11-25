@@ -1,8 +1,9 @@
 name: Sync Yahoo to Gmail
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
+  # Temporarily paused until Yahoo App Password and repository secrets are configured.
+  # schedule:
+  #   - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
